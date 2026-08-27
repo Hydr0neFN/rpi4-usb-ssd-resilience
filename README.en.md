@@ -170,9 +170,3 @@ service running *on* the machine tell you nothing about a power cut, a dead card
 kernel wedge. Add an outbound heartbeat to something external, so silence itself is the
 alert. [`cf-heartbeat/`](https://github.com/Hydr0neFN/hinet-dual-path-probe/tree/main/cf-heartbeat) is a small Cloudflare Worker that does this —
 KV for last-seen, a Cron Trigger to notice the silence, Email Routing to send the mail.
-
-## What software cannot fix
-
-The trigger was almost certainly a physically loose connector, and nothing here repairs
-that. What changed is the consequence: a bump used to take down the whole machine
-indefinitely, and now costs one service for 22 seconds. Fix the connector too.
