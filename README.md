@@ -130,7 +130,3 @@ ACTION=="add|bind|change", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProd
 **沒實測驗證過的 watchdog 等於沒有 watchdog。** BCM2835 硬體 watchdog 上限是 15 秒（可以用 `cat /sys/class/watchdog/watchdog0/timeout` 驗證）。你要求 10 秒，systemd 會回報 15 秒；你要求 30 秒，硬體底層默默還是只給你 15 秒。請務必照真實的硬體上限規劃。
 
 **任何由機器自己發出的警報，都會跟著機器一起陪葬。** 只要通知是透過跑在**那台機器本機**上的服務送出，遇到斷電、記憶卡掛掉、kernel 卡死這些狀況，你絕對收不到任何通知。必須在外部加一個 heartbeat，讓「**機器沒聲音**」這件事本身直接成為警報。[`cf-heartbeat/`](https://github.com/Hydr0neFN/hinet-dual-path-probe/tree/main/cf-heartbeat) 就是做這件事的一個輕量 Cloudflare Worker：用 KV 記錄 last-seen、Cron Trigger 負責察覺沉默、Email Routing 負責發信。
-
-## 軟體修不了的部分
-
-觸發原因幾乎可以確定是接頭實體鬆動，這裡寫的任何軟體邏輯都修不好它。改變的是**故障帶來的後果**：以前碰一下就無限期整台死當，現在的代價只是一個服務暫停 22 秒。**不過實體接觸不良的接頭，有空還是要去修好。**
