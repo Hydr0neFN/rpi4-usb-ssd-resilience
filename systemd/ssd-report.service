@@ -1,0 +1,6 @@
+[Unit]
+Description=Daily USB SSD link health digest
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ssd-report.sh --notify

@@ -158,6 +158,125 @@ Assistant, Tailscale, SSH and the probe all stayed up, systemd unmounted the dea
 cleanly with no zombie mount, and the data service stopped itself rather than running
 against an empty directory.
 
+## When the software fixes stop working, prove *which* layer failed
+
+Two weeks later the same host started dropping the disk again — this time with root safely
+on the SD card, every quirk above verified active, and the drive completely idle. The
+alerts said "I/O error delta 12". That number tells you something is wrong and nothing
+about what.
+
+The signature that settles it is in `dmesg`:
+
+```
+usb 2-1: USB disconnect, device number 6
+usb 2-1: new SuperSpeed USB device number 7 using xhci_hcd   <- 0.3 s later
+```
+
+A **disconnect followed by a fresh enumeration** is not a command timeout, not UAS, and
+not a link-power-management failure. None of those detach the device. Something in the
+physical path — connector, cable, or the bridge itself — actually broke the link. No
+kernel parameter fixes that, so stop looking for one.
+
+That still leaves two very different physical faults, and they need different parts:
+
+|  | drive lost 5 V | data link broke, drive stayed powered |
+|---|---|---|
+| blame | power contact, cable resistance, host current budget | SuperSpeed pairs: connector wear, cable quality, the bridge |
+| fix | powered hub, shorter/thicker cable | reseat, different port, USB 2.0, new enclosure |
+
+**SMART tells you which, for free.** Attributes `12 Power_Cycle_Count` and
+`192 Power-Off_Retract_Count` advance only when the drive genuinely loses power. Sample
+them at the moment of each drop:
+
+```
+smartctl -A -d sat /dev/sda | awk '$1==12||$1==192||$1==194'
+```
+
+Across ten link drops on this machine both counters stayed **flat** — and across two
+deliberate physical unplugs the same evening `Power_Cycle_Count` moved **2867 → 2869**.
+The counter works; the drops simply never removed power. Verdict: SuperSpeed signal
+integrity, not the power rail.
+
+Which also ranks the fixes. The other USB3 port is worth one try because it changes the
+connector contact, but it reuses the same controller and the same cable. **A USB 2.0 port
+is the real escalation**: USB2 does not use the SuperSpeed pairs at all and runs at
+480 Mb/s instead of 5 Gb/s, so it has orders of magnitude more signal margin. You trade
+~150 MB/s for ~40 MB/s. For a media or backup volume that is a bargain — here it turned a
+weekly 20 GB backup from 3 minutes into 10. If USB2 also drops, the enclosure is dead;
+replace it.
+
+One caveat on `-d sat`: an RTL9210B fronts both NVMe and SATA drives, and smartmontools
+guesses NVMe. If `-d sntrealtek`, `-d sntasmedia` and `-d auto` all fail with
+`unsupported scsi opcode`, there is a **SATA** M.2 behind the bridge and `-d sat` is the
+one that works.
+
+### Yes, those really are lost writes
+
+`Buffer I/O error on dev sda1 ... lost async page write` means the write was **dropped,
+not retried**, and each disconnect also produced `Aborting journal` and
+`JBD2: I/O error when updating journal superblock`. It survived here only because the
+volume was idle: every lost block was ext4 metadata, so the `EXT4-fs (sda1): recovery
+complete` on the next mount replayed it, and `dumpe2fs -h` still reports `state: clean`
+with `FS Error count 0`.
+
+Do not read that as harmless. Under real write load, `data=ordered` loses the in-flight
+*data* pages silently — journal replay does not bring those back. A disk that
+re-enumerates every 90 seconds is not "self-healing", it is a disk that has not yet been
+asked to write anything important.
+
+## Do not page a human for a failure you already fixed
+
+The recovery ladder above worked 17 times out of 17. Every one of those successes also
+sent a phone notification, because the health check alerted on a *symptom counter* rather
+than on an outcome. A night of "I/O error delta 12 (warning 1/3)" pushes teaches the owner
+to swipe them away, which is precisely how the one that matters gets missed.
+
+The rule that survives contact with a real incident:
+
+- **Recovery succeeded → log it, do not notify.** It is a non-event.
+- **Recovery failed → notify immediately**, and say what still works. "OS is fine, root is
+  on SD, qbittorrent stays down" is actionable; "I/O error delta 12" is not.
+- **Rate, not incidents → notify once.** Three drops in an hour means the hardware is
+  dying even though every single one was repaired. Cap it at one message per hour.
+- **A daily digest that is silent on a clean day.** Nothing to report is the common case,
+  and a scheduled "all good" message is just training in ignoring you.
+
+[`scripts/ssd-linkwatch.sh`](scripts/ssd-linkwatch.sh) implements the drop accounting and
+the rate alert; [`scripts/ssd-report.sh`](scripts/ssd-report.sh) is the on-demand and daily
+digest. Both write to the **SD card**, so the evidence outlives the disk being diagnosed.
+
+## The hardcoded port path that would have broken all of it, silently
+
+Everything above referred to `/sys/bus/usb/devices/2-1` — including the `authorized`
+toggle, which is the only step that actually revives this bridge, and the `2-1:1.0`
+usb-storage rebind. That path is the **physical port**. Move the plug one socket over and
+it becomes `2-2`, or `1-1.3` on a USB2 port, and the recovery ladder quietly stops being
+able to recover anything. Nothing errors; it just never works again.
+
+Resolve the device by its vendor and product ID instead:
+
+```bash
+# usbdev-rtl9210.sh — print the bridge's sysfs path, wherever it is plugged in
+for d in /sys/bus/usb/devices/*; do
+  [ -f "$d/idVendor" ] || continue
+  [ "$(cat "$d/idVendor")" = "0bda" ] || continue
+  [ "$(cat "$d/idProduct")" = "9210" ] || continue
+  echo "$d"; exit 0
+done
+exit 1
+```
+
+```bash
+USBDEV=$(/usr/local/sbin/usbdev-rtl9210.sh) || USBDEV=/sys/bus/usb/devices/2-1
+USBIF="$(basename "$USBDEV"):1.0"      # for the usb-storage unbind/bind
+```
+
+Worth auditing the rest of the setup for the same class of bug while you are there. Here
+the udev rules already keyed on `idVendor`/`idProduct`, `fstab` used `PARTUUID`, and the
+kernel quirks in `cmdline.txt` keyed on `0bda:9210` — all port-independent. Only the two
+scripts were pinned to a socket, which is exactly the kind of thing that is invisible
+until the day you move the cable to fix something else.
+
 ## Two more things worth copying
 
 **A watchdog you did not check is a watchdog you do not have.** The BCM2835 hardware

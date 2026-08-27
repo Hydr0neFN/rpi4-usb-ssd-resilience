@@ -1,0 +1,8 @@
+[Unit]
+Description=USB SSD link watch + idle keep-alive
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ssd-linkwatch.sh
+TimeoutStartSec=60

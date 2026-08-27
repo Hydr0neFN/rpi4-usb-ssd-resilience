@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the USB SSD link watch every 30s
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
