@@ -277,6 +277,80 @@ kernel quirks in `cmdline.txt` keyed on `0bda:9210` — all port-independent. On
 scripts were pinned to a socket, which is exactly the kind of thing that is invisible
 until the day you move the cable to fix something else.
 
+## The answer was the socket
+
+Moving the enclosure to the other USB3 port on the same host, and fixing the Pi and the
+enclosure physically in place, ended it:
+
+| | before | after |
+|---|---|---|
+| link drops | one every 40–90 s | **0 in 9 h 43 min** |
+| USB device number | walked 3 → 10 in five hours | **stayed at 30** |
+| `dmesg` | a disconnect every minute | nothing since the mount |
+| filesystem | journal replay on every drop | `clean`, `FS Error count 0` |
+
+Then a deliberate soak, because "no drops while idle" proves very little about a bus:
+4 GiB written at 104 MB/s, read back at 291 MB/s, then a simultaneous read and write pass.
+The device number never moved, no new I/O errors, SSD peaked at 43 °C. The link holds
+under sustained load.
+
+So the fault was the **socket contact and plug seating** — not the cable, not the bridge,
+not the drive. That is the least interesting of the possible answers and it was still worth
+the whole diagnostic ladder to reach, because every cheaper explanation had already been
+eliminated by evidence rather than by guessing: SMART said the drive was healthy, the power
+counters said the drive never lost 5 V, `get_throttled` said the host never browned out,
+and the drops happened at idle, at 34 °C, with every kernel quirk verified active. The USB2
+fallback was never needed.
+
+### What the resilience work actually bought
+
+It did not fix the hardware. It made the hardware failure *survivable while the hardware
+failure was being found*, which is a different and more useful property:
+
+- **17 automatic recoveries, 0 failures.** Every drop was repaired without a human.
+- **The OS never blinked.** Root on the SD card, so a disk that vanished 27 times in one
+  session took down nothing: Docker, Home Assistant, Tailscale, SSH and the network probe
+  all stayed up, and systemd unmounted the dead disk cleanly every time.
+- **No data was lost**, and the reason is worth being honest about: the volume happened to
+  be idle. `data=ordered` loses in-flight data pages silently on an aborted journal. This
+  was survivable, not safe.
+
+<!-- The uncomfortable half. -->
+And it has a cost that is easy to miss: **automatic recovery converts a hardware failure
+into silence.** A disk re-enumerating every 90 seconds looked, from the outside, like a
+working machine. Recovery machinery must therefore report the *rate* of what it repaired,
+not just the failures it could not — otherwise it hides exactly the trend you needed.
+
+## Two ways a health check became the fault
+
+Both of these were found on this box, both were caused by monitoring rather than by
+hardware, and both are the kind of thing that only shows up in production.
+
+**A check that counts log lines is not counting incidents.** The I/O health check derived
+its alert from a cumulative `grep -c` over the kernel ring buffer, with `reset SuperSpeed`
+in the pattern. Each re-enumeration emits four of those lines, so every drop was
+double-counted — and an ordinary maintenance replug, which produces ~20 re-enumerations,
+scored a delta of 104. That crossed the *instant* threshold, wrote the alert file, and the
+weekly root backup refuses to run while that file exists. A false positive had silently
+disarmed the backup. Link events now belong to the watcher that counts distinct incidents;
+the health check counts only real I/O failures.
+
+**Installing a package for its CLI can enable a daemon that feeds your health signal.**
+`smartmontools` was installed to get `smartctl` for the diagnosis above. That also enabled
+`smartd`, which cannot monitor a drive behind this USB bridge and exits `status=17`, *"No
+devices to monitor"*, one second after starting. Harmless on its own — except the outbound
+heartbeat derives its degraded flag from `systemctl --failed` being non-empty. Every ping
+for the next ten hours carried the failure suffix. The external watchdog is edge-triggered,
+so it sent one email and then went quiet, which means **the degraded channel was saturated:
+a real fault afterwards would have produced no change in the signal at all.**
+
+A stuck alarm is worse than no alarm, because it looks like an alarm. Two rules came out of
+it: after any `apt install` on a box whose health signal is derived from `systemctl
+--failed`, check `systemctl --failed` before walking away; and never fix this class of
+problem with an ignore-list, because an ignore-list that grows is how a dead-man switch
+quietly stops meaning anything. Disable what does not work instead — `smartctl` on the
+command line is unaffected, and it was the only SMART path any of these scripts used.
+
 ## Two more things worth copying
 
 **A watchdog you did not check is a watchdog you do not have.** The BCM2835 hardware
