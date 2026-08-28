@@ -1,32 +1,45 @@
-# 在 Raspberry Pi 4 上跟一顆接觸不良的 USB SSD 共存
+# Surviving a flaky USB SSD on a Raspberry Pi 4
 
-**繁體中文** · [English](README.en.md)
+**English** · [繁體中文](README.zh-TW.md)
 
-探針主機只要桌子被晃一下就直接當機。以下是問題的**真正原因**，以及在驗證解法的過程中抓到的三個 bug（其中兩個會讓機器直接死透，而且遠端完全救不回來）。
+The probe host was crashing whenever the desk was bumped. This is what was actually
+wrong, and the three bugs found while proving the fix works — including two that would
+have left the machine dead and unreachable.
 
-硬體配備：RPi 4、DietPi on Debian 13，外接 USB SSD 晶片是 **Realtek RTL9210B-CG**（`0bda:9210`），系統 root 檔案系統就裝在那顆 SSD 上。
+Hardware: RPi 4, DietPi on Debian 13, USB SSD behind a **Realtek RTL9210B-CG**
+(`0bda:9210`), root filesystem on that SSD.
 
-## 四個問題，只有第一個是明顯的
+## The four things that were wrong
 
-**1. 把 root 放在可插拔的磁碟上。** USB 接頭瞬間接觸不良，代價應該只是掉一個掛載點，不應該直接搞死整個 kernel。但只要 root 放在 SSD 上，每一次閃斷都是致命的。
+Only the first is obvious.
 
-**2. 外接盒直接吃了 `uas` 驅動。** 路徑在 `/sys/bus/usb/drivers/uas/2-1:1.0`，而且完全沒有設定任何 quirk。RPi 4 + RTL9210 + UAS 是一組出了名容易卡死（stall）的組合。
+**1. Root lived on the removable disk.** A momentary contact glitch on a USB connector
+should cost you a mount. It should not cost you the kernel. With root on the SSD, every
+flicker was fatal.
 
-**3. USB3 link power management 每次開機都協商失敗：**
+**2. UAS was bound to the bridge.** `/sys/bus/usb/drivers/uas/2-1:1.0`, no quirks set
+anywhere. RPi 4 + RTL9210 + UAS is a well-known stall combination.
+
+**3. USB3 link power management was failing every boot:**
 
 ```
 usb 2-1: enable of device-initiated U1 failed
 ```
 
-LPM 協商失敗是造成假性離線的經典元凶，而且平常極容易被忽略——因為裝置**看起來還是能用**。
+LPM negotiation failing is a classic source of spurious disconnects and is easy to miss
+because the device works anyway.
 
-**4. 系統完全沒留下證據，而且這是結構性的問題。** persistent journal 是從 **SSD 上**的目錄 bind mount 過來的，而 `/var/log` 又是只有 50 MB 的 tmpfs（DietPi ramlog）。所以磁碟一斷線，記錄「磁碟斷線」的那份 log 也跟著蒸發。`journalctl --list-boots` 永遠只看得到最後一次開機。當機當了好幾個月，**半筆鑑識資料都沒留下來**。
+**4. There was no evidence, and that was structural.** The persistent journal was
+bind-mounted from a directory **on the SSD**, and `/var/log` is a 50 MB tmpfs (DietPi
+ramlog). So when the disk dropped, the log of the disk dropping died with it.
+`journalctl --list-boots` showed one boot. Months of crashes, zero forensics.
 
-> 如果你正在追一個偶發性的儲存問題，**第一步務必先確認你的 log 到底寫在哪裡**。在把 log 存放位置搞定之前，其他所有動作都只是在瞎猜。
+> If you are debugging intermittent storage, check where your logs live **first**.
+> Everything else is guessing until that is fixed.
 
-## 修法
+## The fix
 
-**把角色對調。** root 改回放 SD 卡；SSD 降級成帶有 `nofail` 參數的資料掛載點。
+**Invert the roles.** Root on the SD card; the SSD demoted to a `nofail` data mount.
 
 ```
 # /etc/fstab
@@ -34,50 +47,58 @@ PARTUUID=<ssd>  /mnt/ssd  ext4  nofail,noatime,x-systemd.device-timeout=10,x-sys
 /mnt/ssd/var/lib/<app>  /var/lib/<app>  none  bind,nofail,x-systemd.requires=/mnt/ssd  0 0
 ```
 
-再加上對應服務的 `RequiresMountsFor=`，這樣它就不可能在掛載點是空的狀態下啟動，然後默默把自己的狀態寫壞。
+Plus `RequiresMountsFor=` on the service that uses the data, so it cannot start against
+an empty mountpoint and quietly corrupt its own state.
 
-**設定外接盒 quirks 強化穩定度**，直接寫在 kernel command line：
+**Harden the bridge** on the kernel command line:
 
 ```
-usb-storage.quirks=0bda:9210:u    # IGNORE_UAS -> 強制走 bulk-only transport
-usbcore.quirks=0bda:9210:k        # NO_LPM -> 關掉一直協商失敗的 U1/U2
+usb-storage.quirks=0bda:9210:u    # IGNORE_UAS -> bulk-only transport
+usbcore.quirks=0bda:9210:k        # NO_LPM -> stop the U1/U2 negotiation that was failing
 usbcore.autosuspend=-1
 ```
 
-並且透過 udev 給 SCSI 層足夠的重試空間，避免稍微卡住就直接放棄：
+and give the SCSI layer room to retry instead of giving up, via udev:
 
 ```
 ACTION=="add|change", KERNEL=="sd[a-z]", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="9210", \
   RUN+="/bin/sh -c 'echo 180 > /sys/block/%k/device/timeout; echo 60 > /sys/block/%k/device/eh_timeout'"
 ```
 
-重開後確認生效的訊息：
+Confirmation it took effect:
 
 ```
 usb 2-1: UAS is ignored for this device, using usb-storage instead
 usb-storage 2-1:1.0: Quirks match for vid 0bda pid 9210: 800000
 ```
 
-此時 `U1 failed` 那行錯誤也不再出現了。唯一代價：關閉 command queuing 之後，循序讀取掉到約 153 MB/s。對純資料碟來說這個交換非常划算，而且讀寫依然是 SD 卡的好幾倍。
+and the `U1 failed` line stops appearing. Cost: sequential read drops to ~153 MB/s
+without command queuing. For bulk storage that is a fine trade; it is still several times
+an SD card.
 
-> **操作順序很重要。** USB quirks 一定要等 root 已經完全搬離 SSD 之後才能套用。萬一 bulk-only transport 剛好搞垮你那顆外接盒，而 root 還在上面，機器就會直接開不起來——而你人可能不在現場。
+> **Order matters.** Apply the USB quirks only *after* root is off the SSD. If bulk-only
+> transport turns out to break your bridge while root still lives on it, the machine will
+> not boot — and you may not be there to fix it.
 
-## 三個「真的動手測才會發現」的 bug
+## Three bugs found by actually testing it
 
-這些問題在你真的手動把硬碟拔掉之前都不會現形。我們可以直接在 bus 層模擬斷線與重連：
+None of these show up until you pull the disk. Simulate it at the bus level:
 
 ```
-echo 2-1 > /sys/bus/usb/drivers/usb/unbind    # 拔
-echo 2-1 > /sys/bus/usb/drivers/usb/bind      # 插回去
+echo 2-1 > /sys/bus/usb/drivers/usb/unbind    # yank
+echo 2-1 > /sys/bus/usb/drivers/usb/bind      # plug back in
 ```
 
-**Bug 1——晶片重新插拔後自己醒不過來。** rebind 之後系統雖然看得到它（`lsusb` 有抓到、`usb-storage` 有掛上、SCSI host 有建立），但 `/dev` 底下**永遠長不出 block device**。dmesg 會一直卡在：
+**Bug 1 — the bridge does not come back on its own.** After a rebind it re-enumerates
+(`lsusb` sees it, `usb-storage` attaches, a SCSI host is created) and then **no block
+device ever appears**. It loops on:
 
 ```
 usb 2-1: reset SuperSpeed USB device number 2 using xhci_hcd
 ```
 
-手動對 SCSI host 做 rescan（`echo "- - -" > /sys/class/scsi_host/host0/scan`）**完全沒有用**。真正有效、而且每次試都能一發成功救回來的是：
+A SCSI host rescan (`echo "- - -" > /sys/class/scsi_host/host0/scan`) does **not** fix
+it. What does, reliably, first attempt, every time:
 
 ```
 echo 0 > /sys/bus/usb/devices/2-1/authorized
@@ -85,36 +106,45 @@ sleep 4
 echo 1 > /sys/bus/usb/devices/2-1/authorized
 ```
 
-取消授權會強迫系統做一次**真正的重新列舉**，徹底跳出卡在半初始化的 reset 迴圈。這是這份文件裡含金量最高的一招。
+Deauthorising forces a genuine re-enumeration instead of the half-initialised reset loop.
+This is the single most useful thing in this document.
 
-**Bug 2——udev 規則永遠等不到觸發。** 直覺上最容易想到的觸發條件是 block device：
+**Bug 2 — the udev rule can never fire.** The obvious trigger is the block device:
 
 ```udev
-ACTION=="add", KERNEL=="sda1", ...        # 錯的
+ACTION=="add", KERNEL=="sda1", ...        # WRONG
 ```
 
-但 `sda1` 正是復原腳本**要想辦法生出來的目標**。這就陷入了雞生蛋蛋生雞的死胡同：規則永遠在等它自己該產生的東西。所以觸發條件必須改綁在 USB 橋接器上——而且除了 `add` 之外還要匹配 `bind`，因為 driver 層做 rebind 時發出的事件是 `bind`：
+But `sda1` is exactly what recovery has to *create*. Chicken and egg: the rule waits
+forever for the thing it is supposed to produce. Trigger on the USB bridge instead — and
+match `bind` as well as `add`, because a driver-level rebind emits `bind`:
 
 ```udev
 ACTION=="add|bind|change", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="9210", \
   TAG+="systemd", ENV{SYSTEMD_WANTS}+="ssd-recover.service"
 ```
 
-**Bug 3——systemd 的啟動速率限制，偏偏在最需要的時候扯後腿。** 預設是 10 秒內最多 5 次。接觸不良產生的連續抖動會在一瞬間衝破這個上限，導致 systemd 直接**罷工拒絕**再次啟動復原 unit。解法是設定 `StartLimitIntervalSec=0` 拔掉上限，並且在腳本內拿 `flock -n` 鎖定，讓重疊觸發的行程自動讓路退出，而不是一起搶著處理同一顆裝置。
+**Bug 3 — systemd start-rate-limiting fights you exactly when it matters.** Default is 5
+starts per 10 s. A flapping connector blows straight through that and systemd then
+*refuses* to start the recovery unit. Set `StartLimitIntervalSec=0`, and take a
+`flock -n` in the script so overlapping triggers step aside instead of fighting over the
+device.
 
-## 復原階梯
+## The recovery ladder
 
-完整的復原邏輯寫在 [`scripts/ssd-recover.sh`](scripts/ssd-recover.sh)，由 udev 觸發，並掛一個 60 秒的 backstop timer 當兜底保護：
+[`scripts/ssd-recover.sh`](scripts/ssd-recover.sh), triggered by udev and by a 60 s
+backstop timer:
 
-1. 快速路徑——如果硬碟本來就正常掛載且可寫入，直接退出什麼都不做。
-2. 裝置已消失但掛載點還卡著 → 先停掉唯一持有 handle 的那個服務，再執行 `umount -l`。
-   **千萬不要**手癢打 `fuser -k -m`，那會把 Docker 和其他所有服務無差別一起殺光。
-3. 最多重試 4 輪：SCSI rescan → `authorized` toggle → `usb-storage` unbind/rebind。
-4. 重新掛載，然後**實測寫入確認沒有被掛成唯讀**。只有在這一步失敗時才去跑 `e2fsck -p`；
-   回傳值 ≥ 2 就直接放棄掛載並發出警報。**絕對不對正常的硬碟隨便自動 fsck，也絕不在半連線狀態下憑感覺盲目 fsck。**
-5. 重新建立資料目錄的 bind mount，重啟相依的服務。
+1. Fast path — already mounted and writable, do nothing.
+2. Stale mount whose device vanished → stop the one service holding handles, then
+   `umount -l`. **Not** `fuser -k -m`, which would take Docker and everything else with it.
+3. Up to 4 attempts of: SCSI rescan → `authorized` toggle → `usb-storage` unbind/rebind.
+4. Mount, then **verify it did not land read-only** and pass a write smoke test. Only if
+   that fails, run `e2fsck -p`; refuse to mount and alert if it returns ≥ 2. Never
+   auto-fsck a healthy disk, and never fsck a half-connected one on a hunch.
+5. Re-bind the data mount, restart the dependent service.
 
-實際從一次真實斷線量到的結果，全程無人介入：
+Measured, hands-off, from a real disconnect:
 
 ```
 20:07:20  --- trigger=udev ---
@@ -123,64 +153,107 @@ ACTION=="add|bind|change", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProd
 20:07:42  mounted /mnt/ssd rw -> service restarted -> recovery complete
 ```
 
-總共只要 22 秒。而且在整個斷線期間，主系統穩如泰山：SD 卡上的 root 始終可寫，Docker、Home Assistant、Tailscale、SSH 與探針全部活得好好的；systemd 乾淨俐落地卸載了那顆死掉的硬碟、沒有殘留殭屍掛載，資料服務也自己停了下來，而不是對著一個空目錄繼續亂寫。
+22 seconds. During the outage the OS never blinked: root writable, Docker, Home
+Assistant, Tailscale, SSH and the probe all stayed up, systemd unmounted the dead disk
+cleanly with no zombie mount, and the data service stopped itself rather than running
+against an empty directory.
 
-## 當軟體解法不再管用，證明到底是「哪一層」壞了
+## When the software fixes stop working, prove *which* layer failed
 
-兩週後，同一台主機又開始掉硬碟——這一次 root 已經安全地待在 SD 卡上、上述所有 quirk 都已確認生效，而且硬碟完全處於閒置狀態。警報寫著「I/O error delta 12」。但這個數字只告訴你有東西壞了，對於「到底是什麼壞了」隻字未提。
+Two weeks later the same host started dropping the disk again — this time with root safely
+on the SD card, every quirk above verified active, and the drive completely idle. The
+alerts said "I/O error delta 12". That number tells you something is wrong and nothing
+about what.
 
-真正能一錘定音的特徵就在 `dmesg` 裡：
+The signature that settles it is in `dmesg`:
 
 ```
 usb 2-1: USB disconnect, device number 6
 usb 2-1: new SuperSpeed USB device number 7 using xhci_hcd   <- 0.3 s later
 ```
 
-**先 disconnect 隨後又重新列舉**既不是 command timeout、不是 UAS，也不是 link-power-management 失敗。上述任何一種狀況都不會讓裝置脫離（detach）。這是實體路徑上的某個環節——接頭、線材，或是橋接器本身——真正中斷了連線。沒有任何 kernel 參數救得了這種問題，別再白費力氣找了。
+A **disconnect followed by a fresh enumeration** is not a command timeout, not UAS, and
+not a link-power-management failure. None of those detach the device. Something in the
+physical path — connector, cable, or the bridge itself — actually broke the link. No
+kernel parameter fixes that, so stop looking for one.
 
-但這依然剩下兩種截然不同的實體故障，而且需要更換的零件完全不同：
+That still leaves two very different physical faults, and they need different parts:
 
-|  | 硬碟失去 5 V 供電 | 資料連線中斷，硬碟保持供電 |
+|  | drive lost 5 V | data link broke, drive stayed powered |
 |---|---|---|
-| 元凶 | 電源接點、線材阻抗、主機供電上限 | SuperSpeed 訊號線：接頭磨損、線材品質、橋接器 |
-| 解法 | 帶外接電源的 Hub、更短／更粗的線材 | 重新插拔、換插別的 port、改走 USB 2.0、換新外接盒 |
+| blame | power contact, cable resistance, host current budget | SuperSpeed pairs: connector wear, cable quality, the bridge |
+| fix | powered hub, shorter/thicker cable | reseat, different port, USB 2.0, new enclosure |
 
-**SMART 能直接免費告訴你答案。**屬性 `12 Power_Cycle_Count` 與 `192 Power-Off_Retract_Count` 只有在硬碟真正斷電時數值才會增加。在每次斷線發生的瞬間去取樣：
+**SMART tells you which, for free.** Attributes `12 Power_Cycle_Count` and
+`192 Power-Off_Retract_Count` advance only when the drive genuinely loses power. Sample
+them at the moment of each drop:
 
 ```
 smartctl -A -d sat /dev/sda | awk '$1==12||$1==192||$1==194'
 ```
 
-在這台機器發生的十次斷線中，這兩個計數器的數值**完全沒變**——而當天晚上兩次刻意手動拔除實體線路的測試中，`Power_Cycle_Count` 確實從 **2867 → 2869** 往前推進。計數器運作正常；那些斷線單純就只是從未斷過電。診斷結論：問題出在 SuperSpeed 訊號完整性（signal integrity），而不是供電軌（power rail）。
+Across ten link drops on this machine both counters stayed **flat** — and across two
+deliberate physical unplugs the same evening `Power_Cycle_Count` moved **2867 → 2869**.
+The counter works; the drops simply never removed power. Verdict: SuperSpeed signal
+integrity, not the power rail.
 
-這也決定了各種解法的優先順序。換插另一個 USB3 port 值得試一次，因為它改變了接頭接觸面，但它依然走同一個控制器與同一條線。**改插 USB 2.0 port 才是真正拉高處置層級的手段**：USB2 完全不走 SuperSpeed 訊號線，而且傳輸速率是 480 Mb/s 而不是 5 Gb/s，因此訊號容限（signal margin）直接大了好幾個數量級。你用 ~150 MB/s 換來 ~40 MB/s。對存放媒體或備份的磁碟區來說，這個交換非常划算——在我們這裡，它只不過把每週一次 20 GB 的備份時間從 3 minutes 變成 10。如果連 USB2 都照樣斷線，那就是外接盒死透了；直接換掉吧。
+Which also ranks the fixes. The other USB3 port is worth one try because it changes the
+connector contact, but it reuses the same controller and the same cable. **A USB 2.0 port
+is the real escalation**: USB2 does not use the SuperSpeed pairs at all and runs at
+480 Mb/s instead of 5 Gb/s, so it has orders of magnitude more signal margin. You trade
+~150 MB/s for ~40 MB/s. For a media or backup volume that is a bargain — here it turned a
+weekly 20 GB backup from 3 minutes into 10. If USB2 also drops, the enclosure is dead;
+replace it.
 
-關於 `-d sat` 有個小提醒：RTL9210B 同時支援 NVMe 與 SATA 硬碟，而 smartmontools 預設會猜背後是 NVMe。如果 `-d sntrealtek`、`-d sntasmedia` 與 `-d auto` 全部失敗並跳出 `unsupported scsi opcode`，就表示橋接器後面接的是一條 **SATA** M.2，這時候只有 `-d sat` 才能正常運作。
+One caveat on `-d sat`: an RTL9210B fronts both NVMe and SATA drives, and smartmontools
+guesses NVMe. If `-d sntrealtek`, `-d sntasmedia` and `-d auto` all fail with
+`unsupported scsi opcode`, there is a **SATA** M.2 behind the bridge and `-d sat` is the
+one that works.
 
-### 沒錯，那些寫入真的遺失了
+### Yes, those really are lost writes
 
-`Buffer I/O error on dev sda1 ... lost async page write` 代表寫入是**直接被丟棄，而不是重試**，而且每一次斷線也都會伴隨 `Aborting journal` 與 `JBD2: I/O error when updating journal superblock`。這次之所以能全身而退，純粹只是因為磁碟區當時處於閒置狀態：每一個遺失的 block 都是 ext4 metadata，所以在下一次掛載時由 `EXT4-fs (sda1): recovery complete` 成功重放（replay），`dumpe2fs -h` 也依然回報 `state: clean` 與 `FS Error count 0`。
+`Buffer I/O error on dev sda1 ... lost async page write` means the write was **dropped,
+not retried**, and each disconnect also produced `Aborting journal` and
+`JBD2: I/O error when updating journal superblock`. It survived here only because the
+volume was idle: every lost block was ext4 metadata, so the `EXT4-fs (sda1): recovery
+complete` on the next mount replayed it, and `dumpe2fs -h` still reports `state: clean`
+with `FS Error count 0`.
 
-千萬別把這當成沒事。在真實的寫入負載下，`data=ordered` 會在背後默默遺失傳輸中的 *data* page——而 journal replay 根本不可能把這些資料救回來。一顆每 90 seconds 就重新列舉一次的硬碟不是什麼「自我修復」，它只是運氣好，還沒被要求寫入任何重要資料而已。
+Do not read that as harmless. Under real write load, `data=ordered` loses the in-flight
+*data* pages silently — journal replay does not bring those back. A disk that
+re-enumerates every 90 seconds is not "self-healing", it is a disk that has not yet been
+asked to write anything important.
 
-## 已經修好的故障，就別發警報吵人了
+## Do not page a human for a failure you already fixed
 
-上面那套復原階梯實測成功了 17 times out of 17。但每一次成功復原都會往手機發送推播通知，因為健康檢查是在針對「症狀計數器（*symptom counter*）」發出警報，而不是看「最終結果」。一整晚不斷收到「I/O error delta 12 (warning 1/3)」這類推播，只會訓練維運者隨手把它們滑掉——而真正要命的那條通知，往往就是這樣被漏掉的。
+The recovery ladder above worked 17 times out of 17. Every one of those successes also
+sent a phone notification, because the health check alerted on a *symptom counter* rather
+than on an outcome. A night of "I/O error delta 12 (warning 1/3)" pushes teaches the owner
+to swipe them away, which is precisely how the one that matters gets missed.
 
-經歷過真實事故考驗後留下來的原則：
+The rule that survives contact with a real incident:
 
-- **復原成功 → 寫入 log，不要發通知。** 既然修好了，這就是一件無關緊要的事件（non-event）。
-- **復原失敗 → 立即通知**，而且要說清楚目前還有什麼正常運作。「系統沒事、root 在 SD 上、qbittorrent 維持關閉」是有意義、可採取行動的資訊；「I/O error delta 12」根本毫無幫助。
-- **看頻率，而非單一事件 → 只發一次通知。** 一小時內斷線三次，意味著硬體快死透了，就算每一次都成功修復也一樣。將通知上限限制在每小時最多一則。
-- **每日摘要在平安無事時保持沉默。** 沒什麼好回報才是最常見的狀況，定時發送「一切安好」的訊息只會訓練人學會無視你。
+- **Recovery succeeded → log it, do not notify.** It is a non-event.
+- **Recovery failed → notify immediately**, and say what still works. "OS is fine, root is
+  on SD, qbittorrent stays down" is actionable; "I/O error delta 12" is not.
+- **Rate, not incidents → notify once.** Three drops in an hour means the hardware is
+  dying even though every single one was repaired. Cap it at one message per hour.
+- **A daily digest that is silent on a clean day.** Nothing to report is the common case,
+  and a scheduled "all good" message is just training in ignoring you.
 
-[`scripts/ssd-linkwatch.sh`](scripts/ssd-linkwatch.sh) 實作了斷線次數統計與頻率警報；[`scripts/ssd-report.sh`](scripts/ssd-report.sh) 則負責即時查詢與每日摘要。兩者都把資料寫在 **SD 卡**上，這樣即使受診斷的硬碟斷線消失，證據也依然能完整保留下來。
+[`scripts/ssd-linkwatch.sh`](scripts/ssd-linkwatch.sh) implements the drop accounting and
+the rate alert; [`scripts/ssd-report.sh`](scripts/ssd-report.sh) is the on-demand and daily
+digest. Both write to the **SD card**, so the evidence outlives the disk being diagnosed.
 
-## 差點默默搞垮這一切的寫死 port 路徑
+## The hardcoded port path that would have broken all of it, silently
 
-上面提到的所有操作都指涉到了 `/sys/bus/usb/devices/2-1`——包括唯一能真正救回這顆橋接器的 `authorized` 切換（toggle），以及 `2-1:1.0` 的 usb-storage rebind。這個路徑對應的是**實體連接埠**（physical port）。只要把插頭換插到隔壁插孔，路徑就會變成 `2-2`，換到 USB2 連接埠則會變成 `1-1.3`，這時整套復原階梯就會默默失去任何復原能力。系統完全不會報錯；它只是從此再也救不回任何東西。
+Everything above referred to `/sys/bus/usb/devices/2-1` — including the `authorized`
+toggle, which is the only step that actually revives this bridge, and the `2-1:1.0`
+usb-storage rebind. That path is the **physical port**. Move the plug one socket over and
+it becomes `2-2`, or `1-1.3` on a USB2 port, and the recovery ladder quietly stops being
+able to recover anything. Nothing errors; it just never works again.
 
-改用 Vendor ID 與 Product ID 來動態解析裝置路徑：
+Resolve the device by its vendor and product ID instead:
 
 ```bash
 # usbdev-rtl9210.sh — print the bridge's sysfs path, wherever it is plugged in
@@ -198,46 +271,95 @@ USBDEV=$(/usr/local/sbin/usbdev-rtl9210.sh) || USBDEV=/sys/bus/usb/devices/2-1
 USBIF="$(basename "$USBDEV"):1.0"      # for the usb-storage unbind/bind
 ```
 
-既然都處理到這裡了，順便把整個系統的其他設定也全面盤查一遍同類型的 bug 是很值得的。在我們這裡，udev 規則本來就綁定 `idVendor`/`idProduct`、`fstab` 使用 `PARTUUID`，而 `cmdline.txt` 裡的 kernel quirks 也是指定 `0bda:9210`——全部都與 port 無關（port-independent）。當初只有那兩支腳本寫死了插孔路徑——而這種事情平時完全隱形，直到哪天你為了排除其他問題換插了線，才會無聲無息地踩雷。
+Worth auditing the rest of the setup for the same class of bug while you are there. Here
+the udev rules already keyed on `idVendor`/`idProduct`, `fstab` used `PARTUUID`, and the
+kernel quirks in `cmdline.txt` keyed on `0bda:9210` — all port-independent. Only the two
+scripts were pinned to a socket, which is exactly the kind of thing that is invisible
+until the day you move the cable to fix something else.
 
-## 答案出在插孔
+## The answer was the socket
 
-把外接盒換插到同一台主機上的另一個 USB3 port，並把 Pi 和外接盒在實體位置上固定好，問題就此終結：
+Moving the enclosure to the other USB3 port on the same host, and fixing the Pi and the
+enclosure physically in place, ended it:
 
-| | 改善前 | 改善後 |
+| | before | after |
 |---|---|---|
-| 斷線次數 | 每 40–90 s 一次 | **0 in 9 h 43 min** |
-| USB 裝置編號 | 五小時內從 3 → 10 | **維持在 30** |
-| `dmesg` | 每分鐘一次 disconnect | 掛載後再無任何訊息 |
-| 檔案系統 | 每次斷線都 replay journal | `clean`, `FS Error count 0` |
+| link drops | one every 40–90 s | **0 in 9 h 43 min** |
+| USB device number | walked 3 → 10 in five hours | **stayed at 30** |
+| `dmesg` | a disconnect every minute | nothing since the mount |
+| filesystem | journal replay on every drop | `clean`, `FS Error count 0` |
 
-接著刻意進行耐久測試，因為「閒置時沒斷線」對 bus 來說根本證明不了什麼：以 104 MB/s 寫入 4 GiB，再以 291 MB/s 讀回，接著跑一輪同時讀寫。裝置編號完全沒變、沒有產生新的 I/O error、SSD 最高溫來到 43 °C。這條連結在持續負載下完全扛住了。
+Then a deliberate soak, because "no drops while idle" proves very little about a bus:
+4 GiB written at 104 MB/s, read back at 291 MB/s, then a simultaneous read and write pass.
+The device number never moved, no new I/O errors, SSD peaked at 43 °C. The link holds
+under sustained load.
 
-所以問題的真正元凶是**插孔接點接觸與插頭咬合**——不是線材、不是橋接器，也不是硬碟本身。這是所有可能答案中最無趣的一個，但它依然值得我們走完一整套診斷階梯才得出這個結論，因為所有更省事的解釋都早已被證據排除，而不是靠瞎猜：SMART 顯示硬碟健康無虞、電源計數器證明硬碟從未失去 5 V 供電、`get_throttled` 證明主機從未發生欠壓（brownout），而且斷線發生在 34 °C 的閒置狀態、所有 kernel quirk 都已確認生效。最終完全不需要退回到 USB2 的備用方案。
+So the fault was the **socket contact and plug seating** — not the cable, not the bridge,
+not the drive. That is the least interesting of the possible answers and it was still worth
+the whole diagnostic ladder to reach, because every cheaper explanation had already been
+eliminated by evidence rather than by guessing: SMART said the drive was healthy, the power
+counters said the drive never lost 5 V, `get_throttled` said the host never browned out,
+and the drops happened at idle, at 34 °C, with every kernel quirk verified active. The USB2
+fallback was never needed.
 
-### 這套韌性機制到底換來了什麼
+### What the resilience work actually bought
 
-它並沒有修好硬體。它做到的，是讓硬體故障在「找出真正問題的期間」**是可以撐得過去的**，這是一項截然不同、而且實用得多的特性：
+It did not fix the hardware. It made the hardware failure *survivable while the hardware
+failure was being found*, which is a different and more useful property:
 
-- **17 次自動復原，0 次失敗（17 automatic recoveries / 0 failures）。** 每一次斷線都在無人介入的情況下自動修復完成。
-- **作業系統連眨都沒眨一下。** root 在 SD 卡上，所以一顆在單次開機中消失了 27 次（27 times）的硬碟沒有搞垮任何東西：Docker、Home Assistant、Tailscale、SSH 與網路探針全部活得好好的，而且 systemd 每次都乾淨俐落地卸載了那顆死掉的硬碟。
-- **完全沒有遺失資料**，而背後的原因值得老實說清楚：純粹只是因為磁碟區當時剛好處於閒置狀態。`data=ordered` 在 journal abort 時會在背後默默丟棄傳輸中的 data page。這只是「撐得過去」，而不是「安全無虞」。
+- **17 automatic recoveries, 0 failures.** Every drop was repaired without a human.
+- **The OS never blinked.** Root on the SD card, so a disk that vanished 27 times in one
+  session took down nothing: Docker, Home Assistant, Tailscale, SSH and the network probe
+  all stayed up, and systemd unmounted the dead disk cleanly every time.
+- **No data was lost**, and the reason is worth being honest about: the volume happened to
+  be idle. `data=ordered` loses in-flight data pages silently on an aborted journal. This
+  was survivable, not safe.
 
 <!-- The uncomfortable half. -->
-而這套機制帶來的代價卻極容易被忽略：**自動復原把硬體故障轉化成了沉默。** 一顆每 90 seconds 就重新列舉一次的硬碟，從外面看起來就像一台正常運作的機器。因此，復原機制必須主動回報它所修復事件的「頻率（*rate*）」，而不僅僅是它修不好的那些失敗——否則它剛好掩蓋了你最需要的惡化趨勢。
+And it has a cost that is easy to miss: **automatic recovery converts a hardware failure
+into silence.** A disk re-enumerating every 90 seconds looked, from the outside, like a
+working machine. Recovery machinery must therefore report the *rate* of what it repaired,
+not just the failures it could not — otherwise it hides exactly the trend you needed.
 
-## 健康檢查反過來變成故障的兩種方式
+## Two ways a health check became the fault
 
-這兩起問題都是在這台機器上抓到的，兩者都是由監控機制而非硬體本身所引發，而且都屬於只有在 production 環境才會現形的那種問題。
+Both of these were found on this box, both were caused by monitoring rather than by
+hardware, and both are the kind of thing that only shows up in production.
 
-**只計算 log 行數的檢查，算出來的根本不是事件次數。** I/O 健康檢查原本是透過在 kernel ring buffer 上執行累加式的 `grep -c`，並將 `reset SuperSpeed` 作為匹配 pattern 來衍生出警報。每次重新列舉都會吐出 4 行這類訊息（four of those lines），導致每一次斷線都被重複計數——而一次平常的維護性重新插拔會產生 ~20 re-enumerations，直接灌出 delta 104 的數值。這瞬間衝破了即時門檻（*instant* threshold），寫入了警報檔案，而每週一次的 root 備份在該檔案存在時會拒絕執行。一則假警報（false positive）就這樣默默解除了備份機制的武裝。現在 link 事件改由專門計算獨立事件的 watcher 負責；健康檢查則只計算真正的 I/O 故障。
+**A check that counts log lines is not counting incidents.** The I/O health check derived
+its alert from a cumulative `grep -c` over the kernel ring buffer, with `reset SuperSpeed`
+in the pattern. Each re-enumeration emits four of those lines, so every drop was
+double-counted — and an ordinary maintenance replug, which produces ~20 re-enumerations,
+scored a delta of 104. That crossed the *instant* threshold, wrote the alert file, and the
+weekly root backup refuses to run while that file exists. A false positive had silently
+disarmed the backup. Link events now belong to the watcher that counts distinct incidents;
+the health check counts only real I/O failures.
 
-**單純為了 CLI 安裝套件，可能會順手啟用一個向健康訊號餵資料的 daemon。** 當初為了上面的診斷而安裝 `smartmontools` 來取得 `smartctl`。但這同時也啟用了 `smartd`，偏偏它無法監控這顆 USB 橋接器後方的硬碟，在啟動一秒後就直接帶著 `status=17`（*「No devices to monitor」*）退出。這件事本身無傷大雅——問題在於對外發送的心跳（heartbeat）是根據 `systemctl --failed` 是否非空來判定 degraded 降級狀態。在接下來的整整十個小時（ten hours）裡，每一次送出的 ping 都附帶了 failure 後綴。外部的 watchdog 走的是邊緣觸發（edge-triggered），因此它在寄出一封通知信後就安靜了下來，這意味著**降級通報管道已經飽和：此後即便發生真正的故障，訊號也不會產生任何變化。**
+**Installing a package for its CLI can enable a daemon that feeds your health signal.**
+`smartmontools` was installed to get `smartctl` for the diagnosis above. That also enabled
+`smartd`, which cannot monitor a drive behind this USB bridge and exits `status=17`, *"No
+devices to monitor"*, one second after starting. Harmless on its own — except the outbound
+heartbeat derives its degraded flag from `systemctl --failed` being non-empty. Every ping
+for the next ten hours carried the failure suffix. The external watchdog is edge-triggered,
+so it sent one email and then went quiet, which means **the degraded channel was saturated:
+a real fault afterwards would have produced no change in the signal at all.**
 
-卡死的警報比沒有警報更糟糕，因為它看起來就像個正常的警報。由此總結出兩條鐵律：在一台健康訊號取決於 `systemctl --failed` 的主機上執行任何 `apt install` 之後，轉身離開前務必先檢查一次 `systemctl --failed`；而且絕不要用「忽略清單（ignore-list）」來解決這類問題，因為不斷膨脹的忽略清單，正是死人開關（dead-man switch）默默失去意義的典型過程。把不會動的東西直接 disable 掉就好——命令列上的 `smartctl` 完全不受影響，而它也是這些腳本唯一會用到的 SMART 路徑。
+A stuck alarm is worse than no alarm, because it looks like an alarm. Two rules came out of
+it: after any `apt install` on a box whose health signal is derived from `systemctl
+--failed`, check `systemctl --failed` before walking away; and never fix this class of
+problem with an ignore-list, because an ignore-list that grows is how a dead-man switch
+quietly stops meaning anything. Disable what does not work instead — `smartctl` on the
+command line is unaffected, and it was the only SMART path any of these scripts used.
 
-## 另外兩件值得抄走的事
+## Two more things worth copying
 
-**沒實測驗證過的 watchdog 等於沒有 watchdog。** BCM2835 硬體 watchdog 上限是 15 秒（可以用 `cat /sys/class/watchdog/watchdog0/timeout` 驗證）。你要求 10 秒，systemd 會回報 15 秒；你要求 30 秒，硬體底層默默還是只給你 15 秒。請務必照真實的硬體上限規劃。
+**A watchdog you did not check is a watchdog you do not have.** The BCM2835 hardware
+watchdog caps at 15 s — `cat /sys/class/watchdog/watchdog0/timeout`. Request 10 s and
+systemd will report 15 s; request 30 s and you silently get 15 s anyway. Plan around the
+real ceiling.
 
-**任何由機器自己發出的警報，都會跟著機器一起陪葬。** 只要通知是透過跑在**那台機器本機**上的服務送出，遇到斷電、記憶卡掛掉、kernel 卡死這些狀況，你絕對收不到任何通知。必須在外部加一個 heartbeat，讓「**機器沒聲音**」這件事本身直接成為警報。[`cf-heartbeat/`](https://github.com/Hydr0neFN/hinet-dual-path-probe/tree/main/cf-heartbeat) 就是做這件事的一個輕量 Cloudflare Worker：用 KV 記錄 last-seen、Cron Trigger 負責察覺沉默、Email Routing 負責發信。
+**Every alert your box can raise dies with the box.** Notifications routed through a
+service running *on* the machine tell you nothing about a power cut, a dead card, or a
+kernel wedge. Add an outbound heartbeat to something external, so silence itself is the
+alert. [`cf-heartbeat/`](https://github.com/Hydr0neFN/hinet-dual-path-probe/tree/main/cf-heartbeat) is a small Cloudflare Worker that does this —
+KV for last-seen, a Cron Trigger to notice the silence, Email Routing to send the mail.
